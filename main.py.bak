@@ -1,0 +1,1754 @@
+"""
+StreamForge API v5 - Multi-Language Stream Scraper
+Scrapes direct m3u8 URLs from multiple sources
+"""
+
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional
+import httpx
+import json
+import re
+import base64
+import time
+import asyncio
+
+app = FastAPI(
+    title="StreamForge API",
+    description="Multi-language m3u8 stream scraper",
+    version="5.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+TMDB_API_KEY = "7967738a03ec215c7d6d675faba9c973"
+TMDB_BASE = "https://api.themoviedb.org/3"
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/html, */*",
+    "Accept-Language": "en-US,en;q=0.5",
+}
+
+
+# ===== Models =====
+
+class ScrapeRequest(BaseModel):
+    tmdb_id: int
+    media_type: str = "movie"
+    season: Optional[int] = None
+    episode: Optional[int] = None
+    sources: Optional[list[str]] = None
+
+
+# ===== Helpers =====
+
+async def get_tmdb_info(tmdb_id: int, media_type: str) -> dict:
+    async with httpx.AsyncClient(timeout=10) as client:
+        type_path = "tv" if media_type == "tv" else "movie"
+        resp = await client.get(
+            f"{TMDB_BASE}/{type_path}/{tmdb_id}",
+            params={"api_key": TMDB_API_KEY, "append_to_response": "external_ids"}
+        )
+        data = resp.json()
+        return {
+            "imdb_id": data.get("external_ids", {}).get("imdb_id"),
+            "title": data.get("title") or data.get("name"),
+            "year": (data.get("release_date") or data.get("first_air_date") or "")[:4],
+        }
+
+
+def detect_language(label: str) -> str:
+    lower = label.lower()
+    if "hindi" in lower or "hin" in lower: return "Hindi"
+    if "tamil" in lower or "tam" in lower: return "Tamil"
+    if "telugu" in lower or "tel" in lower: return "Telugu"
+    if "bengali" in lower or "bangla" in lower or "ben" in lower: return "Bengali"
+    if "malayalam" in lower or "mal" in lower: return "Malayalam"
+    if "kannada" in lower or "kan" in lower: return "Kannada"
+    if "english" in lower or "eng" in lower or "en" == lower: return "English"
+    if "italian" in lower or "ita" in lower or "italiano" in lower: return "Italian"
+    if "french" in lower or "fra" in lower or "vf" in lower: return "French"
+    if "german" in lower or "deu" in lower or "ger" in lower: return "German"
+    if "spanish" in lower or "spa" in lower or "español" in lower: return "Spanish"
+    if "multi" in lower: return "Multi"
+    return "English"
+
+
+# ===== CineSu Scraper =====
+
+async def scrape_cinesu(tmdb_id: int, media_type: str, season: int = None, episode: int = None):
+    results = []
+    errors = []
+
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True, headers=HEADERS) as client:
+            if media_type == "movie":
+                url = f"https://cine.su/v1/stream/master/movie/{tmdb_id}.m3u8"
+            else:
+                s = season or 1
+                e = episode or 1
+                url = f"https://cine.su/v1/stream/master/tv/{tmdb_id}/{s}/{e}.m3u8"
+
+            resp = await client.get(url, headers={
+                "Referer": "https://cine.su/en/watch",
+                "Origin": "https://cine.su",
+            })
+
+            if resp.status_code == 404:
+                errors.append("CineSu: Content not available")
+                return results, errors
+
+            if resp.status_code != 200:
+                errors.append(f"CineSu: HTTP {resp.status_code}")
+                return results, errors
+
+            content = resp.text
+            if "#EXT-X-STREAM-INF" in content:
+                lines = content.split("\n")
+                for i, line in enumerate(lines):
+                    if line.startswith("#EXT-X-STREAM-INF:"):
+                        resolution = re.search(r'RESOLUTION=(\d+x\d+)', line)
+                        name = re.search(r'NAME="([^"]+)"', line)
+                        quality = resolution.group(1) if resolution else "Auto"
+                        label = name.group(1) if name else quality
+                        if i + 1 < len(lines) and lines[i + 1].startswith("http"):
+                            results.append({
+                                "source": "CineSu",
+                                "title": label,
+                                "quality": quality,
+                                "language": "English",
+                                "url": lines[i + 1].strip(),
+                                "type": "m3u8",
+                            })
+            elif ".m3u8" in content:
+                m3u8_match = re.search(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', content)
+                if m3u8_match:
+                    results.append({
+                        "source": "CineSu",
+                        "title": "English Stream",
+                        "quality": "Auto",
+                        "language": "English",
+                        "url": m3u8_match.group(0),
+                        "type": "m3u8",
+                    })
+
+            if not results:
+                errors.append("CineSu: No streams found")
+
+    except Exception as e:
+        errors.append(f"CineSu: {str(e)}")
+
+    return results, errors
+
+
+# ===== VixSrc Scraper =====
+
+async def scrape_vixsrc(tmdb_id: int, media_type: str, season: int = None, episode: int = None):
+    results = []
+    errors = []
+
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers=HEADERS) as client:
+            if media_type == "movie":
+                api_url = f"https://vixsrc.to/api/movie/{tmdb_id}"
+            else:
+                s = season or 1
+                e = episode or 1
+                api_url = f"https://vixsrc.to/api/tv/{tmdb_id}/{s}/{e}"
+
+            api_resp = await client.get(api_url)
+
+            try:
+                api_data = api_resp.json()
+            except:
+                errors.append("VixSrc: API returned non-JSON (possible Cloudflare block)")
+                return results, errors
+
+            src_path = api_data.get("src", "")
+            if not src_path:
+                errors.append("VixSrc: No embed path returned")
+                return results, errors
+
+            embed_resp = await client.get(f"https://vixsrc.to{src_path}")
+
+            if embed_resp.status_code == 410:
+                api_resp2 = await client.get(api_url)
+                try:
+                    api_data2 = api_resp2.json()
+                except:
+                    errors.append("VixSrc: API retry failed")
+                    return results, errors
+                src_path2 = api_data2.get("src", "")
+                if not src_path2:
+                    errors.append("VixSrc: No embed path on retry")
+                    return results, errors
+                embed_resp = await client.get(f"https://vixsrc.to{src_path2}")
+                src_path = src_path2
+
+            html = embed_resp.text
+
+            token = None
+            expires = None
+            playlist_url = None
+
+            mp_match = re.search(r'window\.masterPlaylist\s*=\s*(\{[\s\S]*?\})\s*\n', html)
+            if mp_match:
+                mp_text = mp_match.group(1)
+                token_m = re.search(r"'token'\s*:\s*'([^']+)'", mp_text)
+                expires_m = re.search(r"'expires'\s*:\s*'([^']+)'", mp_text)
+                url_m = re.search(r"url\s*:\s*'([^']+)'", mp_text)
+
+                if token_m: token = token_m.group(1)
+                if expires_m: expires = expires_m.group(1)
+                if url_m: playlist_url = url_m.group(1)
+
+            if not token:
+                token_match = re.search(r'token["\']\s*:\s*["\']([^"\']+)', html)
+                if token_match: token = token_match.group(1)
+            if not playlist_url:
+                url_match = re.search(r'url\s*:\s*["\']([^"\']+playlist[^"\']*)', html)
+                if url_match: playlist_url = url_match.group(1)
+
+            if not (token and playlist_url):
+                errors.append("VixSrc: Could not extract stream parameters from embed")
+                return results, errors
+
+            if not expires:
+                expires = str(int(time.time()) + 86400)
+            sep = "&" if "?" in playlist_url else "?"
+            master_url = f"{playlist_url}{sep}token={token}&expires={expires}&h=1"
+
+            pl_resp = await client.get(master_url, headers={"Referer": f"https://vixsrc.to{src_path}"})
+            pl_content = pl_resp.text
+
+            if "#EXTM3U" in pl_content:
+                audio_tracks = []
+                lines = pl_content.split("\n")
+                for line in lines:
+                    if line.startswith("#EXT-X-MEDIA:TYPE=AUDIO"):
+                        name_match = re.search(r'NAME="([^"]+)"', line)
+                        lang_match = re.search(r'LANGUAGE="([^"]+)"', line)
+                        uri_match = re.search(r'URI="([^"]+)"', line)
+                        if name_match and uri_match:
+                            audio_tracks.append({
+                                "language": name_match.group(1),
+                                "lang_code": lang_match.group(1) if lang_match else name_match.group(1),
+                                "uri": uri_match.group(1),
+                            })
+
+                for i, line in enumerate(lines):
+                    if line.startswith("#EXT-X-STREAM-INF:"):
+                        resolution = re.search(r'RESOLUTION=(\d+x\d+)', line)
+                        quality = resolution.group(1) if resolution else "Auto"
+                        if i + 1 < len(lines) and lines[i + 1].startswith("http"):
+                            video_url = lines[i + 1].strip()
+                            if audio_tracks:
+                                for track in audio_tracks:
+                                    results.append({
+                                        "source": "VixSrc",
+                                        "title": f"{track['language']} Audio",
+                                        "quality": quality,
+                                        "language": detect_language(track["language"]),
+                                        "url": video_url,
+                                        "audio_url": track["uri"],
+                                        "type": "m3u8",
+                                    })
+                            else:
+                                results.append({
+                                    "source": "VixSrc",
+                                    "title": "English Stream",
+                                    "quality": quality,
+                                    "language": "English",
+                                    "url": video_url,
+                                    "type": "m3u8",
+                                })
+            else:
+                results.append({
+                    "source": "VixSrc",
+                    "title": "Stream",
+                    "quality": "Auto",
+                    "language": "Multi",
+                    "url": master_url,
+                    "type": "m3u8",
+                })
+
+            if not results:
+                errors.append("VixSrc: No streams found in playlist")
+
+    except Exception as e:
+        errors.append(f"VixSrc: {str(e)}")
+
+    return results, errors
+
+
+# ===== VidNest Scraper =====
+
+VIDNEST_ALPHABET = "RB0fpH8ZEyVLkv7c2i6MAJ5u3IKFDxlS1NTsnGaqmXYdUrtzjwObCgQP94hoeW+/="
+
+def vidnest_b64_decode(input_str: str) -> str:
+    lookup = {c: i for i, c in enumerate(VIDNEST_ALPHABET)}
+    mod = len(input_str) % 4
+    if mod:
+        input_str += "=" * (4 - mod)
+    result = bytearray()
+    for i in range(0, len(input_str), 4):
+        chunk = input_str[i:i+4]
+        c0 = lookup.get(chunk[0], 64)
+        c1 = lookup.get(chunk[1], 64)
+        c2 = 64 if chunk[2] == "=" else lookup.get(chunk[2], 64)
+        c3 = 64 if chunk[3] == "=" else lookup.get(chunk[3], 64)
+        result.append(((c0 << 2) | (c1 >> 4)) & 0xff)
+        if c2 != 64:
+            result.append((((c1 & 0x0f) << 4) | (c2 >> 2)) & 0xff)
+        if c3 != 64:
+            result.append((((c2 & 0x03) << 6) | c3) & 0xff)
+    return bytes(result).decode("utf-8", errors="ignore")
+
+
+async def scrape_vidnest(tmdb_id: int, media_type: str, season: int = None, episode: int = None):
+    results = []
+    errors = []
+
+    servers = {
+        "purstream": "French",
+        "klikxxi": "English",
+        "hollymoviehd": "English",
+        "moviebox": "Multi",
+        "allmovies": "Multi",
+        "vidlink": "English",
+        "onehd": "English",
+        "flixhq": "English",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True, headers=HEADERS) as client:
+            async def fetch_server(server_name: str, language: str):
+                server_results = []
+                try:
+                    if media_type == "movie":
+                        url = f"https://new.vidnest.fun/{server_name}/movie/{tmdb_id}"
+                    else:
+                        s = season or 1
+                        e = episode or 1
+                        url = f"https://new.vidnest.fun/{server_name}/tv/{tmdb_id}/{s}/{e}"
+
+                    resp = await client.get(url)
+                    if resp.status_code != 200:
+                        return server_results, f"{server_name}: HTTP {resp.status_code}"
+
+                    data = resp.json()
+                    encoded_data = data.get("data", "")
+                    if not encoded_data:
+                        return server_results, f"{server_name}: No data"
+
+                    decoded = vidnest_b64_decode(encoded_data)
+                    parsed = json.loads(decoded)
+
+                    sources = parsed.get("sources", [])
+                    title = parsed.get("title", "")
+
+                    for source in sources:
+                        url_key = None
+                        for key in ["url", "file", "stream", "src", "link"]:
+                            if key in source:
+                                url_key = key
+                                break
+                        if not url_key:
+                            continue
+
+                        stream_url = source[url_key]
+                        quality = source.get("quality") or source.get("label") or source.get("name", "Auto")
+                        source_name = source.get("name", source.get("label", ""))
+                        stream_type = "m3u8" if ".m3u8" in stream_url or source.get("type") == "hls" else "direct"
+
+                        lang = detect_language(source_name) if source_name else language
+
+                        server_results.append({
+                            "source": f"VidNest/{server_name}",
+                            "title": source_name or title,
+                            "quality": quality,
+                            "language": lang,
+                            "url": stream_url,
+                            "type": stream_type,
+                        })
+
+                except Exception as e:
+                    return server_results, f"{server_name}: {str(e)}"
+
+                return server_results, None
+
+            tasks = [fetch_server(name, lang) for name, lang in servers.items()]
+            task_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for result in task_results:
+                if isinstance(result, Exception):
+                    errors.append(f"VidNest: {str(result)}")
+                else:
+                    server_results, error = result
+                    results.extend(server_results)
+                    if error:
+                        errors.append(f"VidNest {error}")
+
+    except Exception as e:
+        errors.append(f"VidNest: {str(e)}")
+
+    return results, errors
+
+
+# ===== Popr Scraper =====
+
+async def scrape_popr(tmdb_id: int, media_type: str, season: int = None, episode: int = None):
+    results = []
+    errors = []
+
+    servers = ["default", "catflix", "hexa", "Gama", "Liligoon", "Sigma", "Prime", "Alfa", "Lamda"]
+
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers=HEADERS) as client:
+            async def fetch_server(server: str):
+                server_results = []
+                try:
+                    if media_type == "movie":
+                        url = f"https://popr.ink/api/vidnest?id={tmdb_id}&type=movie&server={server}"
+                    else:
+                        s = season or 1
+                        e = episode or 1
+                        url = f"https://popr.ink/api/vidnest?id={tmdb_id}&type=tv&server={server}&season={s}&episode={e}"
+
+                    resp = await client.get(url)
+                    if resp.status_code != 200:
+                        return server_results, f"{server}: HTTP {resp.status_code}"
+
+                    data = resp.json()
+                    if not data.get("success"):
+                        return server_results, None
+
+                    for r in data.get("results", []):
+                        for stream in r.get("streams", []):
+                            stream_url = stream.get("url", "")
+                            quality = stream.get("quality", "Auto")
+                            is_m3u8 = stream.get("isM3U8", False)
+                            stream_type = "m3u8" if is_m3u8 else "direct"
+
+                            lang = detect_language(quality)
+
+                            server_results.append({
+                                "source": f"Popr/{server}",
+                                "title": quality,
+                                "quality": quality,
+                                "language": lang,
+                                "url": stream_url,
+                                "type": stream_type,
+                            })
+
+                except Exception as e:
+                    return server_results, f"{server}: {str(e)}"
+
+                return server_results, None
+
+            tasks = [fetch_server(s) for s in servers]
+            task_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for result in task_results:
+                if isinstance(result, Exception):
+                    errors.append(f"Popr: {str(result)}")
+                else:
+                    server_results, error = result
+                    results.extend(server_results)
+                    if error:
+                        errors.append(f"Popr {error}")
+
+            seen_urls = set()
+            unique_results = []
+            for r in results:
+                if r["url"] not in seen_urls:
+                    seen_urls.add(r["url"])
+                    unique_results.append(r)
+            results = unique_results
+
+    except Exception as e:
+        errors.append(f"Popr: {str(e)}")
+
+    return results, errors
+
+
+# ===== VidRock Scraper (AES-encrypted API) =====
+
+async def scrape_vidrock(tmdb_id: int, media_type: str, season: int = None, episode: int = None):
+    results = []
+    errors = []
+
+    try:
+        from Crypto.Cipher import AES as CryptoAES
+        from Crypto.Util.Padding import pad as crypto_pad
+
+        passphrase = b"x7k9mPqT2rWvY8zA5bC3nF6hJ2lK4mN9"
+        aes_key = passphrase[:32]
+        aes_iv = passphrase[:16]
+
+        if media_type == "tv":
+            s = season or 1
+            e = episode or 1
+            item_id = f"{tmdb_id}_{s}_{e}"
+            api_type = "tv"
+        else:
+            item_id = str(tmdb_id)
+            api_type = "movie"
+
+        cipher = CryptoAES.new(aes_key, CryptoAES.MODE_CBC, aes_iv)
+        ct = cipher.encrypt(crypto_pad(item_id.encode(), CryptoAES.block_size))
+        encoded = base64.b64encode(ct).decode().replace("+", "-").replace("/", "_").replace("=", "")
+
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers=HEADERS) as client:
+            resp = await client.get(f"https://vidrock.net/api/{api_type}/{encoded}")
+            if resp.status_code != 200:
+                errors.append(f"VidRock: HTTP {resp.status_code}")
+                return results, errors
+
+            data = resp.json()
+            for server_name, server_data in data.items():
+                if isinstance(server_data, dict) and server_data.get("url"):
+                    url = server_data["url"]
+                    lang = server_data.get("language", "English")
+                    stream_type = server_data.get("type", "hls")
+                    s_type = "m3u8" if stream_type == "hls" or ".m3u8" in url else "direct"
+
+                    results.append({
+                        "source": f"VidRock/{server_name}",
+                        "title": f"{server_name} - {lang}",
+                        "quality": "Auto",
+                        "language": detect_language(lang),
+                        "url": url,
+                        "type": s_type,
+                    })
+
+            if not results:
+                errors.append("VidRock: No streams found")
+
+    except ImportError:
+        errors.append("VidRock: pycryptodome not installed")
+    except Exception as e:
+        errors.append(f"VidRock: {str(e)}")
+
+    return results, errors
+
+
+# ===== DooFlix Scraper (Hindi/Indian content - API based) =====
+
+async def scrape_dooflix(tmdb_id: int, media_type: str, season: int = None, episode: int = None):
+    results = []
+    errors = []
+
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
+            BASE_API = "https://panel.watchkaroabhi.com"
+            API_KEY = "qNhKLJiZVyoKdi9NCQGz8CIGrpUijujE"
+
+            dooflix_headers = {
+                "X-Package-Name": "com.king.moja",
+                "User-Agent": "dooflix",
+                "X-App-Version": "305",
+            }
+            STREAM_REFERER = "https://molop.art/"
+
+            if media_type == "movie":
+                url = f"{BASE_API}/api/3/movie/{tmdb_id}/links?api_key={API_KEY}"
+            else:
+                s = season or 1
+                e = episode or 1
+                url = f"{BASE_API}/api/3/tv/{tmdb_id}/season/{s}/episode/{e}/links?api_key={API_KEY}"
+
+            resp = await client.get(url, headers=dooflix_headers)
+            if resp.status_code != 200:
+                errors.append(f"DooFlix: API error HTTP {resp.status_code}")
+                return results, errors
+
+            data = resp.json()
+            links = data.get("links", [])
+
+            if not links:
+                errors.append("DooFlix: No links found")
+                return results, errors
+
+            for link_obj in links:
+                try:
+                    link_url = link_obj.get("url", "")
+                    host = link_obj.get("host", "Server")
+                    if not link_url:
+                        continue
+
+                    redir_resp = await client.get(
+                        link_url,
+                        headers={
+                            "Referer": STREAM_REFERER,
+                            "User-Agent": "dooflix",
+                        },
+                    )
+
+                    stream_url = None
+                    if redir_resp.status_code in (301, 302, 303, 307, 308):
+                        stream_url = redir_resp.headers.get("location", "")
+                    elif redir_resp.status_code == 200:
+                        stream_url = link_url
+                    else:
+                        stream_url = redir_resp.headers.get("location", link_url)
+
+                    if not stream_url:
+                        continue
+
+                    s_type = "m3u8" if ".m3u8" in stream_url else "direct"
+                    quality = "Auto"
+                    q_match = re.search(r'(\d{3,4})p', stream_url)
+                    if q_match:
+                        quality = q_match.group(1) + "p"
+
+                    results.append({
+                        "source": f"DooFlix/{host}",
+                        "title": f"DooFlix - {host}",
+                        "quality": quality,
+                        "language": "Hindi",
+                        "url": stream_url,
+                        "type": s_type,
+                        "headers": {
+                            "Referer": STREAM_REFERER,
+                            "User-Agent": "dooflix",
+                        },
+                    })
+
+                except Exception as e:
+                    errors.append(f"DooFlix/{host}: {str(e)}")
+
+            if not results:
+                errors.append("DooFlix: No streams resolved")
+
+    except Exception as e:
+        errors.append(f"DooFlix: {str(e)}")
+
+    return results, errors
+
+
+# ===== Castle Scraper (Stremio-style aggregator) =====
+
+async def scrape_castle(tmdb_id: int, media_type: str, season: int = None, episode: int = None):
+    results = []
+    errors = []
+
+    try:
+        import urllib.parse
+
+        info = await get_tmdb_info(tmdb_id, media_type)
+        imdb_id = info.get("imdb_id")
+
+        if not imdb_id:
+            errors.append("Castle: Could not get IMDB ID from TMDB")
+            return results, errors
+
+        CASTLE_API = "https://meowtv.vflix.shop"
+        SKIP_PATTERNS = ["4khdhub", "instant download", "iosmirror", "xdm", "redirecting"]
+
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers=HEADERS) as client:
+            if media_type == "movie":
+                url = f"{CASTLE_API}/stream/movie/{imdb_id}.json"
+            else:
+                s = season or 1
+                e = episode or 1
+                url = f"{CASTLE_API}/stream/series/{imdb_id}:{s}:{e}.json"
+
+            resp = await client.get(url, headers={"Accept": "application/json"})
+            if resp.status_code != 200:
+                errors.append(f"Castle: HTTP {resp.status_code}")
+                return results, errors
+
+            data = resp.json()
+            streams = data.get("streams", [])
+
+            if not streams:
+                errors.append("Castle: No streams found")
+                return results, errors
+
+            for s in streams:
+                s_url = s.get("url", "")
+                if not s_url:
+                    continue
+
+                name = (s.get("name") or "").lower()
+                title = (s.get("title") or "").lower()
+                if any(p in name or p in title for p in SKIP_PATTERNS):
+                    continue
+                if "github.com" in s_url or "googleusercontent" in s_url:
+                    continue
+
+                # Castle often wraps URLs like: https://...?url=ACTUAL_URL
+                actual_url = s_url
+                url_param = re.search(r'[?&]url=([^&]+)', s_url)
+                if url_param:
+                    actual_url = urllib.parse.unquote(url_param.group(1))
+
+                quality = "Auto"
+                q_match = re.search(r'(\d{3,4})p', name + title + actual_url)
+                if q_match:
+                    quality = q_match.group(1) + "p"
+                elif "4k" in (name + title).lower() or "2160" in actual_url:
+                    quality = "4K"
+
+                lang = detect_language(name + " " + title)
+
+                s_type = "m3u8" if ".m3u8" in actual_url else ("direct" if ".mp4" in actual_url or ".mkv" in actual_url else "m3u8")
+
+                results.append({
+                    "source": "Castle",
+                    "title": s.get("name", "Castle Stream"),
+                    "quality": quality,
+                    "language": lang,
+                    "url": actual_url,
+                    "type": s_type,
+                })
+
+            seen_urls = set()
+            unique_results = []
+            for r in results:
+                if r["url"] not in seen_urls:
+                    seen_urls.add(r["url"])
+                    unique_results.append(r)
+            results = unique_results
+
+            if not results:
+                errors.append("Castle: No usable streams after filtering")
+
+    except Exception as e:
+        errors.append(f"Castle: {str(e)}")
+
+    return results, errors
+
+
+# ===== MovieBoxHindi Scraper (Hindi - Cloudflare Worker API) =====
+
+async def scrape_movieboxhindi(tmdb_id: int, media_type: str, season: int = None, episode: int = None):
+    results = []
+    errors = []
+
+    try:
+        WORKER_BASE = "https://moviebox.s4nch1tt.workers.dev"
+
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers=HEADERS) as client:
+            url = f"{WORKER_BASE}/streams?tmdb_id={tmdb_id}&type={media_type}&proxy={WORKER_BASE}"
+            if media_type == "tv":
+                s = season or 1
+                e = episode or 1
+                url += f"&se={s}&ep={e}"
+
+            resp = await client.get(url, headers={
+                "Accept": "application/json",
+                "User-Agent": "StreamForge/1.0",
+            })
+
+            if resp.status_code != 200:
+                errors.append(f"MovieBoxHindi: HTTP {resp.status_code}")
+                return results, errors
+
+            data = resp.json()
+
+            raw_streams = []
+            if isinstance(data, list):
+                raw_streams = data
+            elif isinstance(data, dict):
+                raw_streams = data.get("streams", [])
+
+            if not raw_streams:
+                errors.append("MovieBoxHindi: No streams returned")
+                return results, errors
+
+            for s in raw_streams:
+                stream_url = s.get("proxy_url") or s.get("url", "")
+                if not stream_url:
+                    continue
+
+                quality = "Auto"
+                resolution = s.get("resolution", "")
+                if resolution:
+                    m = re.search(r'(\d+)', str(resolution))
+                    quality = m.group(1) + "p" if m else str(resolution)
+
+                s_name = s.get("name", "")
+                lang = detect_language(s_name)
+
+                results.append({
+                    "source": "MovieBoxHindi",
+                    "title": s_name or "MovieBox Stream",
+                    "quality": quality,
+                    "language": lang,
+                    "url": stream_url,
+                    "type": "m3u8",
+                })
+
+            if not results:
+                errors.append("MovieBoxHindi: No valid streams parsed")
+
+    except Exception as e:
+        errors.append(f"MovieBoxHindi: {str(e)}")
+
+    return results, errors
+
+
+# ===== Videasy Scraper (Multi-server encrypted API) =====
+
+async def scrape_videasy(tmdb_id: int, media_type: str, season: int = None, episode: int = None):
+    results = []
+    errors = []
+
+    try:
+        VIDEASY_HEADERS = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://player.videasy.net",
+            "Referer": "https://player.videasy.net/",
+        }
+        DECRYPT_API = "https://enc-dec.app/api/dec-videasy"
+
+        SERVERS = {
+            "Neon": "https://api.videasy.net/myflixerzupcloud/sources-with-title",
+            "Cypher": "https://api.videasy.net/moviebox/sources-with-title",
+            "Reyna": "https://api.videasy.net/primewire/sources-with-title",
+            "Omen": "https://api.videasy.net/onionplay/sources-with-title",
+            "Breach": "https://api.videasy.net/m4uhd/sources-with-title",
+            "Ghost": "https://api.videasy.net/primesrcme/sources-with-title",
+            "Sage": "https://api.videasy.net/1movies/sources-with-title",
+            "Vyse": "https://api.videasy.net/hdmovie/sources-with-title",
+            "Raze": "https://api.videasy.net/superflix/sources-with-title",
+        }
+
+        info = await get_tmdb_info(tmdb_id, media_type)
+        title = info.get("title", "")
+        year = info.get("year", "")
+        imdb_id = info.get("imdb_id", "")
+
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers=VIDEASY_HEADERS) as client:
+            async def fetch_server(name: str, endpoint: str):
+                server_results = []
+                try:
+                    url = f"{endpoint}?title={title}&mediaType={media_type}&year={year}&tmdbId={tmdb_id}&imdbId={imdb_id or ''}"
+                    if media_type == "tv":
+                        s = season or 1
+                        e = episode or 1
+                        url += f"&seasonId={s}&episodeId={e}"
+
+                    resp = await client.get(url)
+                    encrypted_text = resp.text
+
+                    if not encrypted_text or len(encrypted_text) < 20 or encrypted_text.startswith("<!"):
+                        return server_results, f"{name}: No data or blocked"
+
+                    dec_resp = await client.post(
+                        DECRYPT_API,
+                        json={"text": encrypted_text, "id": str(tmdb_id)},
+                        headers={"Content-Type": "application/json"},
+                    )
+
+                    if dec_resp.status_code != 200:
+                        return server_results, f"{name}: Decrypt failed"
+
+                    decrypted = dec_resp.json()
+                    res_data = decrypted.get("result") or decrypted
+
+                    if not res_data or not res_data.get("sources"):
+                        return server_results, f"{name}: No sources"
+
+                    for s in res_data["sources"]:
+                        stream_url = s.get("url", "")
+                        if not stream_url:
+                            continue
+                        quality = s.get("quality", "Auto")
+
+                        server_results.append({
+                            "source": f"Videasy/{name}",
+                            "title": f"Videasy {name}",
+                            "quality": quality,
+                            "language": "English",
+                            "url": stream_url,
+                            "type": "m3u8",
+                            "headers": {
+                                "Referer": "https://player.videasy.net/",
+                                "Origin": "https://player.videasy.net",
+                                "User-Agent": VIDEASY_HEADERS["User-Agent"],
+                            },
+                        })
+
+                except Exception as e:
+                    return server_results, f"{name}: {str(e)}"
+
+                return server_results, None
+
+            tasks = [fetch_server(name, endpoint) for name, endpoint in SERVERS.items()]
+            task_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for result in task_results:
+                if isinstance(result, Exception):
+                    errors.append(f"Videasy: {str(result)}")
+                else:
+                    server_results, error = result
+                    results.extend(server_results)
+                    if error:
+                        errors.append(f"Videasy {error}")
+
+            seen_urls = set()
+            unique_results = []
+            for r in results:
+                if r["url"] not in seen_urls:
+                    seen_urls.add(r["url"])
+                    unique_results.append(r)
+            results = unique_results
+
+    except Exception as e:
+        errors.append(f"Videasy: {str(e)}")
+
+    return results, errors
+
+
+
+# ===== NetMirror Scraper (Netflix/PrimeVideo/Hotstar via API) =====
+
+async def scrape_netmirror(tmdb_id: int, media_type: str, season: int = None, episode: int = None):
+    results = []
+    errors = []
+
+    try:
+        CONFIG_URL = "https://raw.githubusercontent.com/SaurabhKaperwan/Utils/refs/heads/main/urls.json"
+        FALLBACK_API = "https://tv.imgcdn.kim/newtv"
+        OTT_SERVICES = [
+            {"code": "nf", "name": "Netflix"},
+            {"code": "pv", "name": "PrimeVideo"},
+            {"code": "hs", "name": "Hotstar"},
+        ]
+
+        NETMIRROR_HEADERS = {
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0 /OS.GatuNewTV v1.0",
+            "x-requested-with": "NetmirrorNewTV v1.0",
+        }
+
+        # Get API base URL
+        api_base = FALLBACK_API
+        try:
+            async with httpx.AsyncClient(timeout=10) as cfg_client:
+                cfg_resp = await cfg_client.get(CONFIG_URL)
+                cfg_data = cfg_resp.json()
+                api_base = cfg_data.get("nfmirror", FALLBACK_API)
+        except:
+            pass
+
+        # Get media title from TMDB
+        info = await get_tmdb_info(tmdb_id, media_type)
+        title = info.get("title", "")
+        if not title:
+            errors.append("NetMirror: Could not get title from TMDB")
+            return results, errors
+
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers=HEADERS) as client:
+            async def fetch_service(service: dict):
+                service_results = []
+                service_errors = []
+                try:
+                    svc_code = service["code"]
+                    svc_name = service["name"]
+                    headers = {**NETMIRROR_HEADERS, "ott": svc_code}
+
+                    # Search for the title
+                    search_url = f"{api_base}/search.php?s={title}"
+                    search_resp = await client.get(search_url, headers=headers)
+
+                    if search_resp.status_code != 200:
+                        return service_results, [f"{svc_name}: Search HTTP {search_resp.status_code}"]
+
+                    try:
+                        search_data = search_resp.json()
+                    except:
+                        return service_results, [f"{svc_name}: Search returned non-JSON"]
+
+                    search_results = search_data.get("searchResult", [])
+                    # Fuzzy match: exact first, then starts-with, then contains
+                    match = None
+                    title_lower = title.lower()
+                    for item in search_results:
+                        item_title = item.get("t", "").strip().lower()
+                        if item_title == title_lower:
+                            match = item
+                            break
+                    if not match:
+                        for item in search_results:
+                            item_title = item.get("t", "").strip().lower()
+                            if item_title.startswith(title_lower) or title_lower.startswith(item_title):
+                                match = item
+                                break
+                    if not match:
+                        for item in search_results:
+                            item_title = item.get("t", "").strip().lower()
+                            if title_lower in item_title or item_title in title_lower:
+                                match = item
+                                break
+
+                    if not match or not match.get("id"):
+                        return service_results, [f"{svc_name}: No match found"]
+
+                    net_id = match["id"]
+                    final_id = net_id
+
+                    # For TV, drill down to season/episode
+                    if media_type == "tv":
+                        s = season or 1
+                        e = episode or 1
+
+                        post_resp = await client.get(f"{api_base}/post.php?id={net_id}", headers=headers)
+                        if post_resp.status_code != 200:
+                            return service_results, [f"{svc_name}: Post HTTP {post_resp.status_code}"]
+
+                        try:
+                            post_data = post_resp.json()
+                        except:
+                            return service_results, [f"{svc_name}: Post returned non-JSON"]
+
+                        seasons = post_data.get("season", [])
+                        target_term = f"Season {s}"
+                        season_entry = None
+                        for se in seasons:
+                            if se.get("s", "").__str__().find(target_term) >= 0:
+                                season_entry = se
+                                break
+
+                        if not season_entry or not season_entry.get("id"):
+                            return service_results, [f"{svc_name}: Season {s} not found"]
+
+                        season_id = season_entry["id"]
+                        episode_id = None
+                        page = 1
+
+                        while not episode_id and page < 10:
+                            ep_resp = await client.get(
+                                f"{api_base}/episodes.php?id={season_id}&page={page}",
+                                headers=headers
+                            )
+                            if ep_resp.status_code != 200:
+                                break
+                            try:
+                                ep_data = ep_resp.json()
+                            except:
+                                break
+
+                            episodes_list = ep_data.get("episodes", [])
+                            for ep in episodes_list:
+                                if str(ep.get("ep", "")) == str(e):
+                                    episode_id = ep.get("id")
+                                    break
+
+                            if ep_data.get("nextPageShow") != "1":
+                                break
+                            page += 1
+
+                        if not episode_id:
+                            return service_results, [f"{svc_name}: S{s}E{e} not found"]
+
+                        final_id = episode_id
+
+                    # Get the actual stream
+                    player_resp = await client.get(f"{api_base}/player.php?id={final_id}", headers=headers)
+                    if player_resp.status_code != 200:
+                        return service_results, [f"{svc_name}: Player HTTP {player_resp.status_code}"]
+
+                    try:
+                        player_data = player_resp.json()
+                    except:
+                        return service_results, [f"{svc_name}: Player returned non-JSON"]
+
+                    video_link = player_data.get("video_link", "")
+                    if not video_link:
+                        return service_results, [f"{svc_name}: No video link"]
+
+                    # Verify the m3u8 stream is actually playable
+                    # PrimeVideo/Hotstar use freecdn2.top which returns 404 on segments
+                    if ".m3u8" in video_link:
+                        try:
+                            verify_resp = await client.get(video_link, headers=headers)
+                            verify_text = verify_resp.text
+                            if "#EXTM3U" not in verify_text:
+                                return service_results, [f"{svc_name}: Master playlist unreachable"]
+                            # Check for broken CDN - freecdn2.top segments always return 404
+                            if "freecdn2.top" in verify_text:
+                                seg_match = re.search(r'(https?://[^\s"]+\.m3u8[^\s"]*)', verify_text)
+                                if seg_match:
+                                    seg_resp = await client.get(seg_match.group(1).split('"')[0].split()[0], headers=headers)
+                                    if seg_resp.status_code == 404:
+                                        return service_results, [f"{svc_name}: Stream unplayable (CDN segments 404)"]
+                        except:
+                            pass
+
+                    s_type = "m3u8" if ".m3u8" in video_link else ("direct" if ".mp4" in video_link or ".mkv" in video_link else "m3u8")
+                    quality = "Auto"
+                    q_match = re.search(r'(\d{3,4})p', video_link)
+                    if q_match:
+                        quality = q_match.group(1) + "p"
+
+                    lang = "Hindi" if svc_code == "hs" else "English"
+
+                    service_results.append({
+                        "source": f"NetMirror/{svc_name}",
+                        "title": f"{svc_name} Stream",
+                        "quality": quality,
+                        "language": lang,
+                        "url": video_link,
+                        "type": s_type,
+                        "headers": {
+                            "Referer": player_data.get("referer", ""),
+                            "User-Agent": NETMIRROR_HEADERS["user-agent"],
+                        },
+                    })
+
+                except Exception as ex:
+                    service_errors.append(f"{service['name']}: {str(ex)}")
+
+                return service_results, service_errors
+
+            tasks = [fetch_service(svc) for svc in OTT_SERVICES]
+            task_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for result in task_results:
+                if isinstance(result, Exception):
+                    errors.append(f"NetMirror: {str(result)}")
+                else:
+                    r, e = result
+                    results.extend(r)
+                    errors.extend(e)
+
+            if not results:
+                errors.append("NetMirror: No streams found")
+
+    except Exception as e:
+        errors.append(f"NetMirror: {str(e)}")
+
+    return results, errors
+
+
+# ===== HDMovie2 Scraper (Hindi/Hollywood Hindi Dubbed) =====
+
+async def scrape_hdmovie2(tmdb_id: int, media_type: str, season: int = None, episode: int = None):
+    results = []
+    errors = []
+
+    try:
+        BASE = "https://hdmovie2.com.se"
+        CDN = "https://hdm2.ink"
+        UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+        # Get title from TMDB
+        info = await get_tmdb_info(tmdb_id, media_type)
+        title = info.get("title", "")
+        year = info.get("year", "")
+        if not title:
+            errors.append("HDMovie2: Could not get title from TMDB")
+            return results, errors
+
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers={"User-Agent": UA}) as client:
+
+            # Step 1: Search on the site
+            search_url = f"{BASE}/?s={title}"
+            search_resp = await client.get(search_url, headers={"Referer": f"{BASE}/"})
+            search_html = search_resp.text
+
+            # Parse search results - find matching movie page
+            movie_url = None
+            import re as _re
+            article_pattern = _re.compile(r'<article[^>]*>(.*?)</article>', _re.DOTALL)
+            link_pattern = _re.compile(r'href="(https://hdmovie2\.com\.se/movies/([^"]+)/)"')
+            alt_pattern = _re.compile(r'alt="([^"]+)"')
+
+            best_match = None
+            best_score = 0
+            title_lower = title.lower().replace(":", "").replace("-", " ").strip()
+
+            for article_match in article_pattern.finditer(search_html):
+                article = article_match.group(1)
+                link_m = link_pattern.search(article)
+                if not link_m:
+                    continue
+                if "/feed/" in link_m.group(1):
+                    continue
+
+                alt_m = alt_pattern.search(article)
+                if not alt_m:
+                    continue
+
+                item_url = link_m.group(1)
+                item_title = alt_m.group(1).strip()
+
+                # Simple scoring: exact match > starts with > contains
+                item_lower = item_title.lower().replace(":", "").replace("-", " ").strip()
+                score = 0
+                if item_lower == title_lower:
+                    score = 100
+                elif item_lower.startswith(title_lower) or title_lower.startswith(item_lower):
+                    score = 80
+                elif title_lower in item_lower:
+                    score = 60
+
+                # Year bonus
+                if year and year in item_title:
+                    score += 10
+
+                if score > best_score:
+                    best_score = score
+                    best_match = item_url
+
+            if not best_match or best_score < 30:
+                errors.append("HDMovie2: No matching result found")
+                return results, errors
+
+            # Step 2: Get the movie page to extract post ID
+            page_resp = await client.get(best_match, headers={"Referer": f"{BASE}/"})
+            page_html = page_resp.text
+
+            post_id_match = re.search(r'postid-(\d+)', page_html)
+            if not post_id_match:
+                errors.append("HDMovie2: Could not find post ID")
+                return results, errors
+
+            post_id = post_id_match.group(1)
+
+            # Step 3: Try servers (up to 4) via AJAX
+            for nume in range(1, 5):
+                try:
+                    ajax_resp = await client.post(
+                        f"{BASE}/wp-admin/admin-ajax.php",
+                        data=f"action=doo_player_ajax&post={post_id}&nume={nume}&type=movie",
+                        headers={
+                            "Referer": best_match,
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "User-Agent": UA,
+                        },
+                    )
+
+                    if ajax_resp.status_code != 200:
+                        continue
+
+                    try:
+                        ajax_data = ajax_resp.json()
+                    except:
+                        continue
+
+                    embed_url = ajax_data.get("embed_url", "")
+                    if not embed_url:
+                        continue
+
+                    embed_url = embed_url.replace("\\/", "/")
+
+                    # Try hdm2.ink player
+                    hdm2_match = re.search(r'src="(https://hdm2\.ink/play\?v=[^"]+)"', embed_url)
+                    if hdm2_match:
+                        player_resp = await client.get(hdm2_match.group(1), headers={"Referer": f"{BASE}/"})
+                        player_html = player_resp.text
+                        stream_match = re.search(r'data-stream-url="([^"]+)"', player_html)
+                        if stream_match:
+                            stream_path = stream_match.group(1).replace("&amp;", "&")
+                            final_url = f"{CDN}{stream_path}"
+                            if ".m3u8" not in final_url:
+                                final_url += "#index.m3u8"
+
+                            results.append({
+                                "source": f"HDMovie2/srv{nume}",
+                                "title": "Hindi Dubbed HD",
+                                "quality": "1080p",
+                                "language": "Hindi",
+                                "url": final_url,
+                                "type": "m3u8",
+                                "headers": {
+                                    "Referer": f"{CDN}/",
+                                    "Origin": CDN,
+                                    "User-Agent": UA,
+                                },
+                            })
+                            break
+
+                    # Try molop.art player
+                    molop_match = re.search(r'src="(https://molop\.art/watch\?v=[^"]+)"', embed_url)
+                    if molop_match:
+                        molop_resp = await client.get(molop_match.group(1), headers={"Referer": f"{BASE}/"})
+                        molop_html = molop_resp.text
+                        sniff_match = re.search(r'sniff\([^,]+,[^,]+,\S+?([a-f0-9]{20,})', molop_html)
+                        if sniff_match:
+                            hash_val = sniff_match.group(1)
+                            m3u8_url = f"https://molop.art/m3u8/1/{hash_val}/master.m3u8?s=1&cache=1"
+                            results.append({
+                                "source": f"HDMovie2/molop{nume}",
+                                "title": "Hindi Dubbed HD",
+                                "quality": "1080p",
+                                "language": "Hindi",
+                                "url": m3u8_url,
+                                "type": "m3u8",
+                                "headers": {
+                                    "Referer": "https://molop.art/",
+                                    "Origin": "https://molop.art",
+                                    "User-Agent": UA,
+                                },
+                            })
+                            break
+
+                    # Skip prvs.top and ok.ru
+                    if "prvs.top" in embed_url or "ok.ru" in embed_url:
+                        continue
+
+                except Exception as e:
+                    errors.append(f"HDMovie2/srv{nume}: {str(e)}")
+                    continue
+
+            if not results:
+                errors.append("HDMovie2: No working streams found")
+
+    except Exception as e:
+        errors.append(f"HDMovie2: {str(e)}")
+
+    return results, errors
+
+
+# ===== AllMovieLand Scraper (Hindi/Tamil/Multi via allmovieland.one) =====
+
+async def scrape_allmovieland(tmdb_id: int, media_type: str, season: int = None, episode: int = None):
+    results = []
+    errors = []
+
+    try:
+        UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+        
+        info = await get_tmdb_info(tmdb_id, media_type)
+        title = info.get("title", "")
+        if not title:
+            errors.append("AllMovieLand: Could not get title from TMDB")
+            return results, errors
+
+        # Use single client session throughout (important for cookies/session)
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers={"User-Agent": UA}, http2=False) as client:
+            
+            # Step 1: Search
+            search_resp = await client.get(
+                "https://allmovieland.one/index.php",
+                params={"story": title, "do": "search", "subaction": "search"}
+            )
+            if search_resp.status_code != 200:
+                errors.append(f"AllMovieLand: Search HTTP {search_resp.status_code}")
+                return results, errors
+
+            search_html = search_resp.text
+            articles = re.findall(r'<article[^>]*>(.*?)</article>', search_html, re.DOTALL)
+            
+            if not articles:
+                errors.append("AllMovieLand: No search results")
+                return results, errors
+
+            # Find best match
+            movie_url = None
+            title_lower = title.lower()
+            for article in articles:
+                link_m = re.search(r'href="([^"]+)"', article)
+                h3_m = re.search(r'<h3[^>]*>(.*?)</h3>', article)
+                if link_m and h3_m:
+                    item_title = h3_m.group(1).strip().lower()
+                    if item_title == title_lower or title_lower in item_title:
+                        movie_url = link_m.group(1)
+                        break
+            
+            if not movie_url:
+                # Fallback: first result
+                for article in articles:
+                    link_m = re.search(r'href="([^"]+)"', article)
+                    if link_m:
+                        movie_url = link_m.group(1)
+                        break
+
+            if not movie_url:
+                errors.append("AllMovieLand: Could not find movie URL")
+                return results, errors
+
+            # Step 2: Movie page
+            movie_resp = await client.get(movie_url, headers={"Referer": "https://allmovieland.one/"})
+            movie_html = movie_resp.text
+
+            # Extract player domain and media ID from script section
+            # The variables are inside <script> tags in tabs__content
+            domain_match = re.search(r"AwsIndStreamDomain\s*=\s*['\"]([^'\"]+)['\"]", movie_html)
+            player_domain = domain_match.group(1).rstrip("/") if domain_match else None
+            
+            id_match = re.search(r"src:\s*['\"]([^'\"]+)['\"]", movie_html)
+            media_id = id_match.group(1) if id_match else None
+
+            if not player_domain or not media_id:
+                errors.append(f"AllMovieLand: No player info (domain={player_domain}, id={media_id})")
+                return results, errors
+
+            # Step 3: Embed page - get p3 data
+            embed_url = f"{player_domain}/play/{media_id}"
+            embed_resp = await client.get(embed_url, headers={"Referer": movie_url})
+            embed_html = embed_resp.text
+
+            # Find p3 - try multiple patterns
+            p3_m = re.search(r'let\s+p3\s*=\s*(\{.*?\})\s*;', embed_html)
+            if not p3_m:
+                p3_m = re.search(r'p3\s*=\s*(\{[^;]+\})\s*;', embed_html)
+            if not p3_m:
+                p3_m = re.search(r'(\{"file".*?"key".*?\})', embed_html)
+            
+            if not p3_m:
+                errors.append("AllMovieLand: Could not find player data in embed")
+                return results, errors
+
+            try:
+                p3 = json.loads(p3_m.group(1))
+            except json.JSONDecodeError:
+                errors.append(f"AllMovieLand: Invalid p3 JSON: {p3_m.group(1)[:80]}")
+                return results, errors
+
+            file_url = p3.get("file", "").replace("\\/", "/")
+            csrf_key = p3.get("key", "")
+
+            if not file_url or not csrf_key:
+                errors.append("AllMovieLand: Missing file URL or CSRF key in p3")
+                return results, errors
+
+            # Step 4: POST to get file list - burst with fresh clients
+            file_list = None
+            post_headers = {
+                "X-CSRF-TOKEN": csrf_key,
+                "Referer": embed_url,
+                "Origin": player_domain,
+                "Accept": "application/json, text/plain, */*",
+                "User-Agent": UA,
+            }
+
+            for attempt in range(7):
+                try:
+                    async with httpx.AsyncClient(timeout=10, follow_redirects=True, http2=False) as fresh_client:
+                        resp = await fresh_client.post(file_url, headers=post_headers)
+                        text = resp.text.strip()
+                        if text != "7" and text.startswith("["):
+                            file_list = json.loads(text.replace(",]", "]"))
+                            break
+                except:
+                    pass
+
+            if not file_list:
+                errors.append("AllMovieLand: Could not get file list (7 attempts)")
+                return results, errors
+
+            # Filter files based on media type
+            target_files = []
+            if media_type == "movie":
+                target_files = [f for f in file_list if f.get("file")]
+            else:
+                s = season or 1
+                e = episode or 1
+                for item in file_list:
+                    item_title = item.get("title", "")
+                    s_m = re.search(r'Season\s*(\d+)', item_title, re.I)
+                    if s_m and int(s_m.group(1)) == s:
+                        if item.get("folder"):
+                            for ep_item in item["folder"]:
+                                ep_title = ep_item.get("title", "")
+                                e_m = re.search(r'Episode\s*(\d+)', ep_title, re.I)
+                                if e_m and int(e_m.group(1)) == e:
+                                    if ep_item.get("folder"):
+                                        target_files = [f for f in ep_item["folder"] if f.get("file")]
+                                        break
+                        break
+
+            if not target_files:
+                target_files = [f for f in file_list if f.get("file")][:3]
+
+            # Step 5: Get m3u8 URL for each file - burst
+            for file_obj in target_files:
+                file_path = file_obj.get("file", "").lstrip("~")
+                stream_title = file_obj.get("title", "Stream")
+                if not file_path:
+                    continue
+
+                playlist_url = f"{player_domain}/playlist/{file_path}.txt"
+                
+                m3u8_url = None
+                for attempt in range(7):
+                    try:
+                        async with httpx.AsyncClient(timeout=10, follow_redirects=True, http2=False) as fresh_client:
+                            resp = await fresh_client.post(playlist_url, headers=post_headers)
+                            text = resp.text.strip()
+                            if text != "7" and text.startswith("http"):
+                                m3u8_url = text
+                                break
+                    except:
+                        pass
+
+                if m3u8_url:
+                    lang = detect_language(stream_title)
+                    quality = "Auto"
+                    q_m = re.search(r'(\d{3,4})p', stream_title)
+                    if q_m:
+                        quality = q_m.group(1) + "p"
+
+                    results.append({
+                        "source": "AllMovieLand",
+                        "title": f"AllMovieLand - {stream_title}",
+                        "quality": quality,
+                        "language": lang,
+                        "url": m3u8_url,
+                        "type": "m3u8",
+                        "headers": {
+                            "Referer": f"{player_domain}/",
+                            "Origin": player_domain,
+                            "User-Agent": UA,
+                        },
+                    })
+
+            if not results:
+                errors.append("AllMovieLand: Could not resolve any m3u8 URLs")
+
+    except Exception as e:
+        errors.append(f"AllMovieLand: {str(e)}")
+
+    return results, errors
+
+
+# ===== Source Map =====
+
+SOURCE_MAP = {
+    "cinesu": {"name": "CineSu", "fn": lambda tid, mt, s, e: scrape_cinesu(tid, mt, s, e),
+               "languages": ["English"], "reliability": "high"},
+    "vixsrc": {"name": "VixSrc", "fn": lambda tid, mt, s, e: scrape_vixsrc(tid, mt, s, e),
+               "languages": ["English", "Italian", "Multi"], "reliability": "low",
+               "note": "Cloudflare-blocked from datacenter IPs, works from residential only"},
+    "vidnest": {"name": "VidNest", "fn": lambda tid, mt, s, e: scrape_vidnest(tid, mt, s, e),
+                "languages": ["French", "English", "Multi"], "reliability": "medium"},
+    "popr": {"name": "Popr", "fn": lambda tid, mt, s, e: scrape_popr(tid, mt, s, e),
+             "languages": ["Hindi", "Tamil", "Telugu", "English", "French"], "reliability": "broken", "note": "API returns 403 Forbidden since May 2026"},
+    "vidrock": {"name": "VidRock", "fn": lambda tid, mt, s, e: scrape_vidrock(tid, mt, s, e),
+                "languages": ["English"], "reliability": "high"},
+    "dooflix": {"name": "DooFlix", "fn": lambda tid, mt, s, e: scrape_dooflix(tid, mt, s, e),
+                "languages": ["Hindi", "English", "Multi"], "reliability": "high"},
+    "castle": {"name": "Castle", "fn": lambda tid, mt, s, e: scrape_castle(tid, mt, s, e),
+               "languages": ["English", "Hindi", "Multi"], "reliability": "high"},
+    "movieboxhindi": {"name": "MovieBoxHindi", "fn": lambda tid, mt, s, e: scrape_movieboxhindi(tid, mt, s, e),
+                      "languages": ["Hindi", "English"], "reliability": "high"},
+    "allmovieland": {"name": "AllMovieLand", "fn": lambda tid, mt, s, e: scrape_allmovieland(tid, mt, s, e),
+                "languages": ["Hindi", "Tamil", "Telugu", "English", "Multi"], "reliability": "medium"},
+    "hdmovie2": {"name": "HDMovie2", "fn": lambda tid, mt, s, e: scrape_hdmovie2(tid, mt, s, e),
+                "languages": ["Hindi", "English"], "reliability": "medium"},
+    "netmirror": {"name": "NetMirror", "fn": lambda tid, mt, s, e: scrape_netmirror(tid, mt, s, e),
+                "languages": ["Hindi", "English", "Multi"], "reliability": "high"},
+    "videasy": {"name": "Videasy", "fn": lambda tid, mt, s, e: scrape_videasy(tid, mt, s, e),
+                "languages": ["English", "Multi"], "reliability": "medium"},
+}
+
+DEFAULT_SOURCES = ["cinesu", "vidnest", "dooflix", "castle", "movieboxhindi", "netmirror", "allmovieland", "vidrock"]
+
+
+# ===== Helper: Run scrapers =====
+
+async def run_scrape(tmdb_id: int, media_type: str, season: int = None, episode: int = None, source_keys: list = None):
+    info = await get_tmdb_info(tmdb_id, media_type)
+    title = info.get("title")
+    imdb_id = info.get("imdb_id")
+
+    all_results = []
+    all_errors = []
+    keys = source_keys or DEFAULT_SOURCES
+
+    async def run_one(key: str):
+        src = SOURCE_MAP.get(key)
+        if not src:
+            return [], [f"{key}: Unknown source"]
+        try:
+            r, e = await asyncio.wait_for(src["fn"](tmdb_id, media_type, season, episode), timeout=45)
+            return r, e
+        except asyncio.TimeoutError:
+            return [], [f"{src['name']}: Timeout (45s)"]
+        except Exception as ex:
+            return [], [f"{src['name']}: {str(ex)}"]
+
+    tasks = [run_one(k) for k in keys]
+    task_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for result in task_results:
+        if isinstance(result, Exception):
+            all_errors.append(f"Scraper failed: {str(result)}")
+        else:
+            r, e = result
+            all_results.extend(r)
+            all_errors.extend(e)
+
+    seen_urls = set()
+    unique_results = []
+    for r in all_results:
+        if r["url"] not in seen_urls:
+            seen_urls.add(r["url"])
+            unique_results.append(r)
+
+    return {
+        "success": len(unique_results) > 0,
+        "tmdb_id": tmdb_id,
+        "imdb_id": imdb_id,
+        "title": title,
+        "year": info.get("year"),
+        "results": unique_results,
+        "errors": all_errors if all_errors else None,
+    }
+
+
+# ===== Root: JSON documentation =====
+
+@app.get("/")
+async def root():
+    return {
+        "api": "StreamForge",
+        "version": "5.0.0",
+        "description": "Multi-language m3u8 stream scraper",
+        "endpoints": {
+            "movie": {
+                "all_sources": "/movie/{tmdb_id}",
+                "single_source": "/movie/{tmdb_id}/{source}",
+                "example": "/movie/912649",
+                "example_source": "/movie/912649/popr",
+            },
+            "tv": {
+                "all_sources": "/tv/{tmdb_id}/{season}/{episode}",
+                "single_source": "/tv/{tmdb_id}/{season}/{episode}/{source}",
+                "example": "/tv/1396/1/1",
+                "example_source": "/tv/1396/1/1/cinesu",
+            },
+            "search": {
+                "path": "/search/{query}",
+                "example": "/search/Venom",
+            },
+            "api_endpoints": {
+                "health": "GET /api/health",
+                "sources": "GET /api/sources",
+                "search": "GET /api/search?q={query}",
+                "scrape": "POST /api/scrape",
+                "scrape_all": "POST /api/scrape/all",
+            },
+        },
+        "sources": {key: {"name": src["name"], "languages": src["languages"], "reliability": src["reliability"],
+                           **({"note": src["note"]} if "note" in src else {})}
+                    for key, src in SOURCE_MAP.items()},
+        "default_sources": DEFAULT_SOURCES,
+        "tips": [
+            "No source = default sources (cinesu, vidnest, dooflix, castle, movieboxhindi, netmirror, allmovieland, vidrock)",
+            "Best for Hindi: /movie/ID/allmovieland or /movie/ID/dooflix or /movie/ID/movieboxhindi or /movie/ID/castle",
+            "Best for English: /movie/ID/cinesu or /movie/ID/vidrock or /movie/ID/videasy",
+            "Best for French: /movie/ID/vidnest",
+            "Castle: Stremio aggregator, returns multiple streams from different providers",
+            "NetMirror: Searches Netflix, PrimeVideo, Hotstar via API - great for Hindi/English",
+            "VixSrc: Blocked from cloud IPs, works residential only",
+            "m3u8 links work in VLC, mpv, or any HLS player",
+        ],
+    }
+
+
+# ===== Simple GET endpoints =====
+
+@app.get("/movie/{tmdb_id}")
+async def movie_all(tmdb_id: int):
+    return await run_scrape(tmdb_id, "movie")
+
+@app.get("/movie/{tmdb_id}/{source}")
+async def movie_source(tmdb_id: int, source: str):
+    source = source.lower()
+    if source not in SOURCE_MAP:
+        raise HTTPException(400, {"error": f"Unknown source '{source}'", "available": list(SOURCE_MAP.keys())})
+    return await run_scrape(tmdb_id, "movie", source_keys=[source])
+
+@app.get("/tv/{tmdb_id}/{season}/{episode}")
+async def tv_all(tmdb_id: int, season: int, episode: int):
+    return await run_scrape(tmdb_id, "tv", season=season, episode=episode)
+
+@app.get("/tv/{tmdb_id}/{season}/{episode}/{source}")
+async def tv_source(tmdb_id: int, season: int, episode: int, source: str):
+    source = source.lower()
+    if source not in SOURCE_MAP:
+        raise HTTPException(400, {"error": f"Unknown source '{source}'", "available": list(SOURCE_MAP.keys())})
+    return await run_scrape(tmdb_id, "tv", season=season, episode=episode, source_keys=[source])
+
+@app.get("/search/{query}")
+async def search_simple(query: str, page: int = 1):
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            f"{TMDB_BASE}/search/multi",
+            params={"api_key": TMDB_API_KEY, "query": query, "page": page, "include_adult": False}
+        )
+        data = resp.json()
+        filtered = [r for r in data.get("results", []) if r.get("media_type") in ("movie", "tv")]
+
+        results = []
+        for r in filtered[:20]:
+            mid = r.get("id")
+            mt = r.get("media_type", "movie")
+            t = r.get("title") or r.get("name", "Unknown")
+            year = (r.get("release_date") or r.get("first_air_date") or "")[:4]
+            results.append({
+                "id": mid,
+                "type": "TV" if mt == "tv" else "Movie",
+                "title": t,
+                "year": year,
+                "url": f"/{mt}/{mid}" if mt == "movie" else f"/tv/{mid}/1/1",
+            })
+
+        return {
+            "query": query,
+            "count": len(results),
+            "results": results,
+        }
+
+
+# ===== JSON API endpoints =====
+
+@app.get("/api/health")
+async def health():
+    return {"status": "ok", "timestamp": int(time.time())}
+
+@app.get("/api/sources")
+async def list_sources():
+    return {
+        "sources": {key: {"name": src["name"], "languages": src["languages"], "reliability": src["reliability"],
+                           **({"note": src["note"]} if "note" in src else {})}
+                    for key, src in SOURCE_MAP.items()},
+        "default": DEFAULT_SOURCES,
+    }
+
+@app.get("/api/search")
+async def search_tmdb(q: str = Query(...), page: int = 1):
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            f"{TMDB_BASE}/search/multi",
+            params={"api_key": TMDB_API_KEY, "query": q, "page": page, "include_adult": False}
+        )
+        data = resp.json()
+        filtered = [r for r in data.get("results", []) if r.get("media_type") in ("movie", "tv")]
+        return {
+            "page": data.get("page"),
+            "total_pages": data.get("total_pages"),
+            "total_results": data.get("total_results"),
+            "results": filtered,
+        }
+
+@app.post("/api/scrape")
+async def scrape(request: ScrapeRequest):
+    source_keys = None
+    if request.sources:
+        source_keys = [s.lower() for s in request.sources]
+    return await run_scrape(request.tmdb_id, request.media_type, request.season, request.episode, source_keys)
+
+@app.post("/api/scrape/all")
+async def scrape_all(request: ScrapeRequest):
+    return await run_scrape(request.tmdb_id, request.media_type, request.season, request.episode, list(SOURCE_MAP.keys()))
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=7860)
